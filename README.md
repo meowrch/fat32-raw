@@ -34,7 +34,7 @@ fn main() -> std::io::Result {
         params.root_cluster,
     )?;
 
-    let filename = "bt_keys.json";
+    let filename = "file.json";
 
     if let Some(content) = volume.read_file(filename)? {
         println!("Старое содержимое файла '{}':\n{}", filename, String::from_utf8_lossy(&content));

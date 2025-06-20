@@ -2,8 +2,15 @@
 name = "fat32-raw"
 version = "0.1.0"
 edition = "2024"
+authors = ["DIMFLIX <dimflix.official@gmail.com>"]
+description = "Лёгкая и безопасная Rust-библиотека для работы с FAT32-разделами и образами"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/meowrch/fat32-raw"
+readme = "README.md"
+keywords = ["fat32", "filesystem", "esp", "rust", "raw"]
+categories = ["filesystem", "low-level"]
+homepage = "https://github.com/meowrch/fat32-raw"
 
-[dependencies]
-fatfs = "0.3.6"
-fscommon = "0.1.1"
-
+[lib]
+name = "fat32_raw"
+path = "src/lib.rs"
