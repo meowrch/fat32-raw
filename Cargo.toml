@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 repository = "https://github.com/meowrch/fat32-raw"
 readme = "README.md"
 keywords = ["fat32", "filesystem", "esp", "rust", "raw"]
-categories = ["filesystem", "low-level"]
+categories = ["filesystem"]
 homepage = "https://github.com/meowrch/fat32-raw"
 
 [lib]
