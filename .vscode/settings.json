@@ -1,0 +1,6 @@
+{
+    "[rust]": {
+        "editor.defaultFormatter": "statiolake.vscode-rustfmt",
+        "editor.formatOnSave": true  //optional
+    }
+}

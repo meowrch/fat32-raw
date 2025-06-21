@@ -1,9 +1,9 @@
 [package]
 name = "fat32-raw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["DIMFLIX <dimflix.official@gmail.com>"]
-description = "Лёгкая и безопасная Rust-библиотека для работы с FAT32-разделами и образами"
+description = "Lightweight and safe Rust library for working with FAT32 partitions and images"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/meowrch/fat32-raw"
 readme = "README.md"

@@ -2,7 +2,6 @@
 Лёгкая и безопасная Rust-библиотека для работы с FAT32-разделами и образами, с поддержкой чтения, записи и автодетектом параметров.
 
 ## ✨ Особенности
-
 - 💾 Работа с raw-образами и raw-дисками FAT32 (ESP, SD-карты, флешки)  
 - 🔍 Автоматическое определение параметров раздела (BPB)  
 - 📖 Чтение и ✍️ запись файлов с поддержкой изменения размера  
@@ -13,19 +12,19 @@
 
 ## 🚀 Пример использования с образом
 ```rust
+use fat32_raw::fat32::{read_bpb, Fat32Volume};
 use std::fs::OpenOptions;
-use fat32_raw::{Fat32Volume, read_bpb};
 
-fn main() -> std::io::Result {
+fn main() -> std::io::Result<()> {
+    // Открываем образ и читаем параметры FAT32
     let device_path = r"C:\path\to\esp.img";
-    let esp_start_lba = 0;
-
     let mut file = OpenOptions::new().read(true).write(true).open(device_path)?;
-    let params = read_bpb(&mut file, esp_start_lba * 512)?;
+    let params = read_bpb(&mut file, 0)?;
 
+    // Открываем FAT32 том
     let mut volume = Fat32Volume::open(
         device_path,
-        esp_start_lba,
+        0,
         params.bytes_per_sector,
         params.sectors_per_cluster as u32,
         params.reserved_sectors as u32,
@@ -34,22 +33,36 @@ fn main() -> std::io::Result {
         params.root_cluster,
     )?;
 
-    let filename = "file.json";
-
-    if let Some(content) = volume.read_file(filename)? {
-        println!("Старое содержимое файла '{}':\n{}", filename, String::from_utf8_lossy(&content));
+    // Создаём файл с длинным именем
+    let filename = "test.conf";
+    if volume.create_file_lfn(filename)? {
+        println!("Файл '{}' создан", filename);
+    } else {
+        println!("Файл '{}' уже существует", filename);
     }
 
-    let new_json = br#"{"foo": "bar", "count": 123}"#;
-    volume.write_file(filename, new_json)?;
+    // Записываем данные в файл
+    let content = b"Привет из fat32-raw!";
+    volume.write_file(filename, content)?;
+    println!("Данные записаны в '{}'", filename);
 
-    if let Some(content) = volume.read_file(filename)? {
-        println!("Новое содержимое файла '{}':\n{}", filename, String::from_utf8_lossy(&content));
+    // Читаем данные из файла
+    if let Some(data) = volume.read_file(filename)? {
+        println!("Содержимое '{}': {}", filename, String::from_utf8_lossy(&data));
+    }
+
+    // Удаляем файл
+    if volume.delete_file_lfn(filename)? {
+        println!("Файл '{}' удалён", filename);
     }
 
     Ok(())
 }
 ```
+
+> [!info] 
+> Полный пример использования находится в `./src/bin/main.rs`
+> Для запуска используйте команду `cargo run --bin main`
 
 ### Пример открытия реального ESP-раздела (Windows):
 > [!warning] 
@@ -58,7 +71,7 @@ fn main() -> std::io::Result {
 
 ```rust
 use std::fs::OpenOptions;
-use fat32_raw::{Fat32Volume, read_bpb};
+use fat32_raw::fat32::{Fat32Volume, read_bpb};
 
 fn main() -> std::io::Result {
     let device_path = r"\\.\PhysicalDrive0";
@@ -91,11 +104,11 @@ fat32-raw = "0.1"
 ```
 
 ## 🚧 Планы на будущее
-- 📂 Поддержка создания и удаления файлов и директорий  
-- 📁 Работа с поддиректориями  
-- 💻 Интеграция с реальными дисками Windows и Linux  
-- 🧩 Автоматическое определение разделов на диске (GPT/MBR парсинг)  
-- 🧪 Тесты и CI
+- [X] Поддержка создания и удаления файлов и директорий  
+- [ ] Работа с поддиректориями  
+- [ ] Интеграция с реальными дисками Windows и Linux  
+- [ ] Автоматическое определение разделов на диске (GPT/MBR парсинг)  
+- [ ] Тесты и CI
 
 ## 📄 Лицензия
 Проект распространяется под лицензией [GPLv3](./LICENSE).
