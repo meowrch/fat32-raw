@@ -60,7 +60,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-> [!info] 
+> [!tip] 
 > Полный пример использования находится в `./src/bin/main.rs`
 > Для запуска используйте команду `cargo run --bin main`
 
