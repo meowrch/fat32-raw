@@ -1,39 +1,61 @@
-use fat32_raw::fat32::{read_bpb, Fat32Volume};
-use std::fs::OpenOptions;
+//! Пример использования библиотеки для работы с FAT32-томом или образом ESP-раздела.
+//!
+//! **ВНИМАНИЕ:** Для тестов рекомендуется использовать файл-образ (например, esp.img),
+//! а не реальный раздел диска, чтобы избежать потери данных!
 
-fn main() -> std::io::Result<()> {
-    let device_path = r"C:\path\to\esp.img";
-    let esp_start_lba = 0;
+use fat32_raw::fat32::{Fat32Volume};
+use std::io::Result;
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device_path)?;
-    let params = read_bpb(&mut file, esp_start_lba * 512)?;
+/// Основная функция: демонстрирует работу с образом и с реальным ESP-разделом.
+fn main() -> Result<()> {
+    // === Рекомендуемый вариант: работа с образом ===
+    let image_path = "esp.img";
+    println!("Открытие FAT32-тома по образу '{}'", image_path);
+    if let Some(mut volume) = Fat32Volume::open_esp(Some(image_path))? {
+        run_demo(&mut volume)?;
+    } else {
+        println!("Не удалось открыть FAT32-образ '{}'", image_path);
+    }
 
-    let mut volume = Fat32Volume::open(
-        device_path,
-        esp_start_lba,
-        params.bytes_per_sector,
-        params.sectors_per_cluster as u32,
-        params.reserved_sectors as u32,
-        params.num_fats as u32,
-        params.sectors_per_fat,
-        params.root_cluster,
-    )?;
-
-    println!("Содержимое корня до создания:");
-    print_dir(&mut volume)?;
-
-    test_file_workflow(&mut volume)?;
-    test_dir_workflow(&mut volume)?;
-
-    println!("Содержимое корня после всех операций:");
-    print_dir(&mut volume)?;
+    // === Альтернативный вариант: автоматический поиск ESP-раздела ===
+    //
+    // ВНИМАНИЕ!
+    // При разработке и тестировании библиотеки рекомендуется использовать только образы дисков (например, esp.img),
+    // чтобы избежать риска повреждения данных на реальных разделах.
+    //
+    // Если вы используете библиотеку в реальных приложениях и уверены в стабильности,
+    // автоматический поиск и работа с настоящим ESP-разделом возможны.
+    // Однако, вся ответственность за сохранность данных лежит на вас:
+    // библиотека не гарантирует 100% корректность работы с каждым конкретным диском.
+    //
+    /*
+    println!("Автоматический поиск и открытие ESP-раздела на реальном диске...");
+    if let Some(mut volume) = Fat32Volume::open_esp::<&str>(None)? {
+        run_demo(&mut volume)?;
+    } else {
+        println!("ESP раздел не найден!");
+    }
+    */
 
     Ok(())
 }
 
+/// Демонстрирует создание, запись, чтение и удаление файлов и директорий.
+fn run_demo(volume: &mut Fat32Volume) -> Result<()> {
+    println!("Содержимое корня до операций:");
+    print_dir(volume)?;
+
+    test_file_workflow(volume)?;
+    test_dir_workflow(volume)?;
+
+    println!("Содержимое корня после всех операций:");
+    print_dir(volume)?;
+
+    Ok(())
+}
+
+
+/// Демонстрирует создание, запись, чтение и удаление файла.
 fn test_file_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     let filename = "test.conf";
     if volume.create_file_lfn(filename)? {
@@ -73,23 +95,7 @@ fn test_file_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     Ok(())
 }
 
-fn print_dir_contents(volume: &mut Fat32Volume, dirname: &str) -> std::io::Result<()> {
-    let entries = volume.list_directory_by_name(dirname)?;
-    println!("Содержимое директории '{}':", dirname);
-    if entries.is_empty() {
-        println!("(пусто)");
-    } else {
-        for e in entries {
-            let typ = if e.is_directory { "<DIR>" } else { "     " };
-            println!(
-                "{:20} {}  кластер={}  размер={}",
-                e.name, typ, e.start_cluster, e.size
-            );
-        }
-    }
-    Ok(())
-}
-
+/// Демонстрирует создание, проверку и удаление директории.
 fn test_dir_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     let dirname = "testdir";
     if volume.create_dir_lfn(dirname)? {
@@ -102,9 +108,9 @@ fn test_dir_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     print_dir(volume)?;
 
     println!("Содержимое папки testdir:");
-    print_dir_contents(volume, "testdir")?;
+    print_dir_contents(volume, dirname)?;
 
-    // Проверяем, что директория пуста (только . и ..)
+    // Проверяем, пуста ли директория
     let dir_cluster = {
         let entries = volume.list_root()?;
         entries
@@ -137,9 +143,9 @@ fn test_dir_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     Ok(())
 }
 
-// Вспомогательная функция для красивого вывода содержимого папки
+/// Красиво выводит содержимое корневой директории.
 fn print_dir(volume: &mut Fat32Volume) -> std::io::Result<()> {
-    let entries = &volume.list_root()?;
+    let entries = volume.list_root()?;
     if entries.is_empty() {
         println!("(пусто)");
     } else {
@@ -154,29 +160,36 @@ fn print_dir(volume: &mut Fat32Volume) -> std::io::Result<()> {
     Ok(())
 }
 
-// Вспомогательная функция для получения содержимого директории по имени
-trait Fat32DirExt {
-    fn list_directory_by_name(
-        &mut self,
-        dirname: &str,
-    ) -> std::io::Result<Vec<fat32_raw::fat32::Fat32FileEntry>>;
+/// Красиво выводит содержимое указанной директории.
+fn print_dir_contents(volume: &mut Fat32Volume, dirname: &str) -> std::io::Result<()> {
+    let entries = list_directory_by_name(volume, dirname)?;
+    if entries.is_empty() {
+        println!("(пусто)");
+    } else {
+        for e in entries {
+            let typ = if e.is_directory { "<DIR>" } else { "     " };
+            println!(
+                "{:20} {}  кластер={}  размер={}",
+                e.name, typ, e.start_cluster, e.size
+            );
+        }
+    }
+    Ok(())
 }
 
-impl Fat32DirExt for Fat32Volume {
-    fn list_directory_by_name(
-        &mut self,
-        dirname: &str,
-    ) -> std::io::Result<Vec<fat32_raw::fat32::Fat32FileEntry>> {
-        let entries = self.list_root()?;
-        let dir = entries
-            .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(dirname) && e.is_directory);
-        if let Some(dir_entry) = dir {
-            let all = self.list_directory(dir_entry.start_cluster)?;
-            // Оставляем только реально существующие записи (имя не пустое)
-            Ok(all.into_iter().filter(|e| !e.name.is_empty()).collect())
-        } else {
-            Ok(Vec::new())
-        }
+/// Получает содержимое директории по имени.
+fn list_directory_by_name(
+    volume: &mut Fat32Volume,
+    dirname: &str,
+) -> std::io::Result<Vec<fat32_raw::fat32::Fat32FileEntry>> {
+    let entries = volume.list_root()?;
+    let dir = entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(dirname) && e.is_directory);
+    if let Some(dir_entry) = dir {
+        let all = volume.list_directory(dir_entry.start_cluster)?;
+        Ok(all.into_iter().filter(|e| !e.name.is_empty()).collect())
+    } else {
+        Ok(Vec::new())
     }
 }
