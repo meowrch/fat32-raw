@@ -45,6 +45,7 @@ pub fn read_bpb(file: &mut std::fs::File, offset: u64) -> std::io::Result<Fat32P
 }
 
 pub struct Fat32Volume {
+    sync_on_write: bool,
     file: File,
     fat_offset: u64,
     data_offset: u64,
@@ -56,6 +57,7 @@ pub struct Fat32Volume {
 
 impl Fat32Volume {
     pub fn open(
+        sync_on_write: bool,
         device_path: &str,
         esp_start_lba: u64,
         bytes_per_sector: u16,
@@ -87,6 +89,7 @@ impl Fat32Volume {
                 * bytes_per_sector_u64;
 
         Ok(Fat32Volume {
+            sync_on_write,
             file,
             fat_offset,
             data_offset,
@@ -239,6 +242,9 @@ impl Fat32Volume {
     fn flush_fat(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(self.fat_offset))?;
         self.file.write_all(&self.fat)?;
+        if self.sync_on_write {
+            self.file.sync_all()?;
+        }
         Ok(())
     }
 
@@ -633,6 +639,7 @@ impl Fat32Volume {
             }
 
             Fat32Volume::open(
+                false,
                 path_str,
                 0, // lba = 0 для образа
                 params.bytes_per_sector,
@@ -687,6 +694,7 @@ impl Fat32Volume {
                     }
 
                     Fat32Volume::open(
+                        true, // sync_on_write = true для реальных устройств (безопаснее)
                         &path,
                         lba, // LBA
                         params.bytes_per_sector,
