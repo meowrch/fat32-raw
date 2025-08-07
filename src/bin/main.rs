@@ -3,7 +3,7 @@
 //! **ВНИМАНИЕ:** Для тестов рекомендуется использовать файл-образ (например, esp.img),
 //! а не реальный раздел диска, чтобы избежать потери данных!
 
-use fat32_raw::fat32::{Fat32Volume};
+use fat32_raw::fat32::volume::Fat32Volume;
 use std::io::Result;
 
 /// Основная функция: демонстрирует работу с образом и с реальным ESP-разделом.
@@ -75,10 +75,10 @@ fn test_file_workflow(volume: &mut Fat32Volume) -> std::io::Result<()> {
     }
 
     match volume.read_file(filename)? {
-        Some(data) => println!(
+        Some(ref data) => println!(
             "Содержимое '{}': {}",
             filename,
-            String::from_utf8_lossy(&data)
+            String::from_utf8_lossy(data)
         ),
         None => println!("Файл '{}' не найден после записи!", filename),
     }
