@@ -1,4 +1,4 @@
-use super::{*};
+use super::*;
 use crate::fat32::file::{parse_dir_entry, parse_lfn_entry};
 
 pub fn parse_directory_entries(cluster_data: &[u8]) -> Vec<(String, u32, u32, u8)> {

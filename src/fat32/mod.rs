@@ -1,13 +1,11 @@
-pub mod volume;
-pub mod file;
 pub mod directory;
+pub mod fat_table;
+pub mod file;
+pub mod lfn;
 pub mod utils;
-
-#[cfg(target_os = "linux")]
-use glob::glob;
+pub mod volume;
 
 use log;
-use std::path::Path;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -16,7 +14,7 @@ use std::string::String;
 pub(crate) const DIR_ENTRY_SIZE: usize = 32;
 pub(crate) const LFN_ATTRIBUTE: u8 = 0x0F;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Fat32FileEntry {
     pub name: String,
     pub start_cluster: u32,

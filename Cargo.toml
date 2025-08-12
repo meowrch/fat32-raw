@@ -1,25 +1,33 @@
 [package]
 name = "fat32-raw"
-version = "0.3.0"
-edition = "2024"
+version = "1.0.0"
+edition = "2021"
 authors = ["DIMFLIX <dimflix.official@gmail.com>"]
-description = "Lightweight and safe Rust library for working with FAT32 partitions and images"
+description = "Cross-platform Rust library for direct FAT32 partition manipulation with ESP support"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/meowrch/fat32-raw"
 readme = "README.md"
-keywords = ["fat32", "filesystem", "esp", "rust", "raw"]
-categories = ["filesystem"]
+keywords = ["fat32", "filesystem", "esp", "efi", "raw"]
+categories = ["filesystem", "os", "hardware-support"]
 homepage = "https://github.com/meowrch/fat32-raw"
+documentation = "https://docs.rs/fat32-raw"
+rust-version = "1.70.0"
 
 [lib]
 name = "fat32_raw"
 path = "src/lib.rs"
 
+[dependencies]
+log = "0.4.27"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1.0"
+
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winbase", "fileapi"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_SystemServices", "Win32_System_WindowsProgramming", "Win32_System_Ioctl"] }
+winapi = { version = "0.3", features = ["fileapi", "winbase", "winioctl", "ioapiset", "handleapi", "winnt"] }
 
 [target.'cfg(unix)'.dependencies]
 glob = "0.3"
 
-[dependencies]
-log = "0.4.27"
+[dev-dependencies]
+env_logger = "0.10"

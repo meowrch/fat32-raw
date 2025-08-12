@@ -1,7 +1,12 @@
-use super::{*};
-use crate::fat32::utils::find_esp_device;
+use super::*;
 use crate::fat32::directory::parse_directory_entries;
-use crate::fat32::file::{generate_short_name, lfn_checksum, make_lfn_entries, parse_dir_entry, parse_lfn_entry};
+use crate::fat32::file::{
+    lfn_checksum, make_lfn_entries, parse_dir_entry, parse_lfn_entry,
+};
+use crate::fat32::lfn::generate_short_name;
+
+// Используем платформозависимую функцию поиска ESP
+use crate::platform::find_esp_device;
 
 pub fn read_bpb(file: &mut std::fs::File, offset: u64) -> std::io::Result<Fat32Params> {
     use std::io::Seek;
@@ -27,6 +32,8 @@ pub struct Fat32Volume {
     sectors_per_cluster: u32,
     root_cluster: u32,
     fat: Vec<u8>,
+    #[cfg(windows)]
+    volume_path: Option<std::path::PathBuf>, // Путь к Volume для Windows (\\?\Volume{GUID}\)
 }
 
 impl Fat32Volume {
@@ -41,6 +48,16 @@ impl Fat32Volume {
         sectors_per_fat: u32,
         root_cluster: u32,
     ) -> io::Result<Fat32Volume> {
+        // На Windows открываем PhysicalDrive без специальных флагов, чтобы избежать требований выравнивания буферов
+        #[cfg(windows)]
+        let mut file = {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(device_path)?
+        };
+        
+        #[cfg(not(windows))]
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -71,16 +88,155 @@ impl Fat32Volume {
             sectors_per_cluster,
             root_cluster,
             fat,
+            #[cfg(windows)]
+            volume_path: None, // Will be set in open_esp if needed
         })
     }
 
+    /// Обновляет кеш FAT из файловой системы (перечитывает FAT таблицу с диска)
+    pub fn refresh_fat_cache(&mut self) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(self.fat_offset))?;
+        self.file.read_exact(&mut self.fat)?;
+        log::debug!("FAT cache refreshed from disk");
+        Ok(())
+    }
+
+    /// Полностью сбрасывает все кеши и синхронизирует с диском
+    pub fn refresh_all_caches(&mut self) -> io::Result<()> {
+        // Синхронизируем все записи на диск
+        self.file.sync_all()?;
+
+        // На Windows: если знаем GUID-путь тома, открываем именно том и выполняем Flush + LOCK/UNLOCK
+        #[cfg(windows)]
+        {
+            use std::ffi::OsStr;
+            use std::os::windows::ffi::OsStrExt;
+            use winapi::um::fileapi::{CreateFileW, FlushFileBuffers, OPEN_EXISTING};
+            use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+            use winapi::um::ioapiset::DeviceIoControl;
+            use winapi::um::winioctl::{FSCTL_LOCK_VOLUME, FSCTL_UNLOCK_VOLUME};
+            use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+
+            if let Some(ref vol_path) = self.volume_path {
+                // Удаляем завершающий обратный слэш, чтобы CreateFileW открыл том
+                let mut s = vol_path.as_os_str().to_string_lossy().to_string();
+                if s.ends_with('\\') {
+                    s.pop();
+                }
+                let wide: Vec<u16> = OsStr::new(&s).encode_wide().chain(Some(0)).collect();
+                unsafe {
+                    let h = CreateFileW(
+                        wide.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null_mut(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    );
+                    if h != INVALID_HANDLE_VALUE {
+                        // Сброс буферов тома
+                        let _ = FlushFileBuffers(h);
+                        // Лёгкая последовательность LOCK/UNLOCK, чтобы заставить систему синхронизировать состояние
+                        let mut br: u32 = 0;
+                        let _ = DeviceIoControl(
+                            h,
+                            FSCTL_LOCK_VOLUME,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut br,
+                            std::ptr::null_mut(),
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        let _ = DeviceIoControl(
+                            h,
+                            FSCTL_UNLOCK_VOLUME,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null_mut(),
+                            0,
+                            &mut br,
+                            std::ptr::null_mut(),
+                        );
+                        // Закрываем дескриптор
+                        winapi::um::handleapi::CloseHandle(h);
+                    }
+                }
+            }
+        }
+
+        // Обновляем FAT кеш после всех операций
+        self.refresh_fat_cache()?;
+
+        log::info!("All caches refreshed and synced with disk");
+        Ok(())
+    }
+
     fn read_cluster(&mut self, cluster_num: u32) -> io::Result<Vec<u8>> {
+        // Validate cluster number
+        if cluster_num < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid cluster number {} (must be >= 2)", cluster_num),
+            ));
+        }
+
         let cluster_size = self.sectors_per_cluster as u64 * self.bytes_per_sector as u64;
         let cluster_offset = self.data_offset + (cluster_num as u64 - 2) * cluster_size;
+
+        // Всегда делаем seek перед чтением, чтобы гарантировать чтение с диска
         self.file.seek(SeekFrom::Start(cluster_offset))?;
+
         let mut buf = vec![0u8; cluster_size as usize];
         self.file.read_exact(&mut buf)?;
         Ok(buf)
+    }
+
+    /// Читает цепочку кластеров начиная с указанного
+    fn read_chain(&mut self, start_cluster: u32) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let mut current_cluster = start_cluster;
+
+        while current_cluster < 0x0FFFFFF8 && current_cluster != 0 {
+            let cluster_data = self.read_cluster(current_cluster)?;
+            data.extend_from_slice(&cluster_data);
+            current_cluster = self.get_fat_entry(current_cluster);
+        }
+
+        Ok(data)
+    }
+
+    /// Записывает данные в цепочку кластеров начиная с указанного
+    fn write_chain(&mut self, start_cluster: u32, data: &[u8]) -> io::Result<()> {
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let mut current_cluster = start_cluster;
+        let mut offset = 0;
+
+        while current_cluster < 0x0FFFFFF8 && current_cluster != 0 && offset < data.len() {
+            let cluster_offset =
+                self.data_offset + (current_cluster as u64 - 2) * cluster_size as u64;
+            self.file.seek(SeekFrom::Start(cluster_offset))?;
+
+            let to_write = (data.len() - offset).min(cluster_size);
+            self.file.write_all(&data[offset..offset + to_write])?;
+
+            // Если данные не помещаются полностью в кластер, заполняем остаток нулями
+            if to_write < cluster_size {
+                let zeros = vec![0u8; cluster_size - to_write];
+                self.file.write_all(&zeros)?;
+            }
+
+            offset += to_write;
+            current_cluster = self.get_fat_entry(current_cluster);
+        }
+
+        if self.sync_on_write {
+            self.file.sync_all()?;
+        }
+
+        Ok(())
     }
 
     fn get_fat_entry(&self, cluster_num: u32) -> u32 {
@@ -115,14 +271,63 @@ impl Fat32Volume {
         Ok(entries)
     }
 
-    pub fn read_file(&mut self, filename: &str) -> io::Result<Option<Vec<u8>>> {
-        let entries = self.list_root()?;
+    pub fn read_file(&mut self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        log::debug!("read_file: Reading file at path: {}", path);
+        
+        // Normalize path
+        let path_normalized = path.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        log::debug!("read_file: Path parts: {:?}", parts);
+        
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        
+        // Determine parent directory and filename
+        let filename = parts.last().unwrap();
+        let parent_cluster = if parts.len() > 1 {
+            // Find the parent directory
+            let dir_path = parts[..parts.len() - 1].join("/");
+            log::debug!("read_file: Looking for parent directory: {}", dir_path);
+            match self.find_directory(&dir_path)? {
+                Some(cluster) => {
+                    log::debug!("read_file: Parent directory found at cluster {}", cluster);
+                    cluster
+                },
+                None => {
+                    log::debug!("read_file: Parent directory not found");
+                    return Ok(None);
+                }
+            }
+        } else {
+            // File is in root directory
+            log::debug!("read_file: File is in root directory (cluster {})", self.root_cluster);
+            self.root_cluster
+        };
+        
+        // List files in parent directory
+        log::debug!("read_file: Listing directory at cluster {}", parent_cluster);
+        let entries = self.list_directory(parent_cluster)?;
+        log::debug!("read_file: Found {} entries in directory", entries.len());
+        
+        // Find the file
         for entry in entries {
+            log::debug!("read_file: Checking entry: name='{}', is_dir={}, size={}, cluster={}", 
+                       entry.name.trim(), entry.is_directory, entry.size, entry.start_cluster);
             if entry.name.trim().eq_ignore_ascii_case(filename) && !entry.is_directory {
+                log::debug!("read_file: Found matching file, reading {} bytes from cluster {}", 
+                           entry.size, entry.start_cluster);
+                
                 let mut cluster = entry.start_cluster;
                 let mut remaining = entry.size;
                 let mut content = Vec::new();
-                while cluster < 0x0FFFFFF8 {
+                
+                while cluster < 0x0FFFFFF8 && cluster != 0 {
+                    log::debug!("read_file: Reading cluster {}, {} bytes remaining", cluster, remaining);
                     let data = self.read_cluster(cluster)?;
                     let to_take = remaining.min(data.len() as u32) as usize;
                     content.extend_from_slice(&data[..to_take]);
@@ -132,69 +337,252 @@ impl Fat32Volume {
                     }
                     cluster = self.get_fat_entry(cluster);
                 }
+                
+                log::debug!("read_file: Successfully read {} bytes", content.len());
                 return Ok(Some(content));
             }
         }
+        
+        log::debug!("read_file: File '{}' not found in directory", filename);
         Ok(None)
     }
 
-    pub fn write_file(&mut self, filename: &str, new_content: &[u8]) -> io::Result<bool> {
-        // 1. Находим файл в корне
-        let entries = self.list_root()?;
-        let mut entry_opt = None;
+    /// Записывает файл по пути (с созданием директорий если необходимо)
+    pub fn write_file_with_path(&mut self, path: &str, new_content: &[u8]) -> io::Result<bool> {
+        // На Windows пытаемся сначала использовать filesystem-based write
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+
+            // Создаём директории если нужно
+            let path_normalized = path.replace('\\', "/");
+            let parts: Vec<&str> = path_normalized
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if parts.len() > 1 {
+                let dir_path = parts[..parts.len() - 1].join("/");
+                self.create_directory_path(&dir_path)?;
+            }
+
+            if let Err(e) = crate::platform::windows::write_file_to_esp(Path::new(path), new_content) {
+                log::warn!(
+                    "write_file_to_esp failed for {}, falling back to raw write: {}",
+                    path,
+                    e
+                );
+            } else {
+                // После успешной записи через Windows API максимально синхронизируемся
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after write: {}", e);
+                }
+
+                // Подождём, пока файловая система отразит изменения (ESP часто кешируется)
+                let path_normalized = path.replace('\\', "/");
+                let parts: Vec<&str> = path_normalized
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let filename = parts.last().copied().unwrap_or("");
+                let parent_cluster = if parts.len() > 1 {
+                    let dir_path = parts[..parts.len() - 1].join("/");
+                    match self.find_directory(&dir_path)? {
+                        Some(cluster) => cluster,
+                        None => self.root_cluster,
+                    }
+                } else {
+                    self.root_cluster
+                };
+
+                let mut visible = false;
+                for attempt in 0..30 {
+                    let entries = self.list_directory(parent_cluster)?;
+                    if entries.iter().any(|e| !e.is_directory && e.name.trim().eq_ignore_ascii_case(filename)) {
+                        visible = true;
+                        log::info!("File '{}' visible after {} attempt(s)", filename, attempt + 1);
+                        break;
+                    }
+                    log::debug!("File '{}' not yet visible (attempt {}/30), sleeping...", filename, attempt + 1);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    // Попробуем так же обновить FAT кеш между попытками
+                    let _ = self.refresh_fat_cache();
+                }
+                if !visible {
+                    log::warn!("File '{}' not visible after write via Windows API, continuing anyway", filename);
+                }
+
+                return Ok(true);
+            }
+        }
+
+        // Разделяем путь на директории и имя файла
+        let path_normalized = path.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if parts.is_empty() {
+            return Ok(false);
+        }
+
+        let filename = parts.last().unwrap();
+        let dir_path = if parts.len() > 1 {
+            parts[..parts.len() - 1].join("/")
+        } else {
+            String::new()
+        };
+
+        // Создаём директории если нужно
+        if !dir_path.is_empty() {
+            self.create_directory_path(&dir_path)?;
+        }
+
+        // Находим родительскую директорию
+        let parent_cluster = if dir_path.is_empty() {
+            self.root_cluster
+        } else {
+            self.find_directory(&dir_path)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Parent directory not found")
+            })?
+        };
+
+        // Ищем файл в родительской директории
+        let entries = self.list_directory(parent_cluster)?;
+        let mut existing_entry = None;
         for entry in &entries {
             if entry.name.trim().eq_ignore_ascii_case(filename) && !entry.is_directory {
-                entry_opt = Some(entry);
+                existing_entry = Some(entry.clone());
                 break;
             }
         }
-        let entry = match entry_opt {
+
+        // Если файл не существует, создаём его
+        let entry = match existing_entry {
             Some(e) => e,
-            None => return Ok(false),
+            None => {
+                // Создаём новый файл
+                if let Some(new_cluster) = self.create_entry_lfn(filename, 0x20, parent_cluster)? {
+                    // Создаём новую структуру для нового файла
+                    Fat32FileEntry {
+                        name: filename.to_string(),
+                        start_cluster: new_cluster,
+                        size: 0,
+                        is_directory: false,
+                    }
+                } else {
+                    return Ok(false);
+                }
+            }
         };
+
+        // Далее логика записи содержимого (как в оригинале)
+        self.write_file_content(&entry, new_content, parent_cluster)
+    }
+
+    pub fn write_file(&mut self, filename: &str, new_content: &[u8]) -> io::Result<bool> {
+        self.write_file_with_path(filename, new_content)
+    }
+
+    // Вспомогательный метод для записи содержимого файла
+    fn write_file_content(
+        &mut self,
+        entry: &Fat32FileEntry,
+        new_content: &[u8],
+        parent_cluster: u32,
+    ) -> io::Result<bool> {
         let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
         let needed_clusters = (new_content.len() + cluster_size - 1) / cluster_size;
-        // 2. Собираем текущую цепочку кластеров
+
+        // Собираем текущую цепочку кластеров
         let mut clusters = Vec::new();
         let mut cluster = entry.start_cluster;
-        while cluster < 0x0FFFFFF8 {
-            clusters.push(cluster);
-            cluster = self.get_fat_entry(cluster);
+
+        // Если это новый файл с кластером 0, выделяем первый кластер
+        if cluster == 0 || cluster >= 0x0FFFFFF8 {
+            let free = self
+                .find_free_cluster()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Нет свободных кластеров"))?;
+            // Сразу помечаем как занятый (EOC), чтобы не выбрать повторно
+            self.set_fat_entry(free, 0x0FFFFFFF);
+            clusters.push(free);
+            // Обновляем запись в директории с новым start_cluster
+            self.update_file_start_cluster_in_dir(parent_cluster, &entry.name, free)?;
+        } else {
+            while cluster < 0x0FFFFFF8 {
+                clusters.push(cluster);
+                cluster = self.get_fat_entry(cluster);
+            }
         }
-        // 3. Если не хватает кластеров — выделяем новые
+
+        // Если не хватает кластеров — выделяем новые
         while clusters.len() < needed_clusters {
             let free = self
                 .find_free_cluster()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Нет свободных кластеров"))?;
+            // Сразу помечаем новый кластер как EOC (занят), затем свяжем предыдущий на него
+            self.set_fat_entry(free, 0x0FFFFFFF);
             self.set_fat_entry(*clusters.last().unwrap(), free);
             clusters.push(free);
         }
-        // 4. Если лишние — освобождаем
+
+        // Если лишние — освобождаем
         while clusters.len() > needed_clusters {
             let last = clusters.pop().unwrap();
             self.set_fat_entry(last, 0);
         }
-        // 5. Завершаем цепочку
+
+        // Завершаем цепочку
         if let Some(&last) = clusters.last() {
             self.set_fat_entry(last, 0x0FFFFFFF);
         }
-        // 6. Записываем новые данные по кластерам
+
+        // Записываем новые данные по кластерам
         let mut offset = 0;
         for &cl in &clusters {
             let cluster_offset = self.data_offset + (cl as u64 - 2) * cluster_size as u64;
             self.file.seek(SeekFrom::Start(cluster_offset))?;
             let to_write = (new_content.len() - offset).min(cluster_size);
-            self.file
-                .write_all(&new_content[offset..offset + to_write])?;
-            if to_write < cluster_size {
-                let zeroes = vec![0u8; cluster_size - to_write];
-                self.file.write_all(&zeroes)?;
+
+            #[cfg(windows)]
+            {
+                // На Windows используем улучшенную стратегию записи для ESP
+                match self.write_data_with_retry(&new_content[offset..offset + to_write]) {
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+                if to_write < cluster_size {
+                    let zeroes = vec![0u8; cluster_size - to_write];
+                    match self.write_data_with_retry(&zeroes) {
+                        Ok(_) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
             }
+            #[cfg(not(windows))]
+            {
+                self.file
+                    .write_all(&new_content[offset..offset + to_write])?;
+                if to_write < cluster_size {
+                    let zeroes = vec![0u8; cluster_size - to_write];
+                    self.file.write_all(&zeroes)?;
+                }
+            }
+
             offset += to_write;
         }
-        // 7. Обновляем размер файла в директории
-        self.update_file_size_in_dir(entry.start_cluster, new_content.len() as u32)?;
-        // 8. Сохраняем FAT на диск
+
+        // Обновляем размер файла в директории
+        let first_cluster = clusters.first().copied();
+        self.update_file_size_in_dir_by_name(
+            parent_cluster,
+            &entry.name,
+            new_content.len() as u32,
+            first_cluster,
+        )?;
+
+        // Сохраняем FAT на диск
         self.flush_fat()?;
         Ok(true)
     }
@@ -222,43 +610,6 @@ impl Fat32Volume {
         Ok(())
     }
 
-    fn update_file_size_in_dir(&mut self, start_cluster: u32, new_size: u32) -> io::Result<()> {
-        // Находим запись в директории и обновляем размер (4 байта)
-        let mut dir_cluster = self.root_cluster;
-        loop {
-            let cluster_offset = self.data_offset
-                + (dir_cluster as u64 - 2)
-                    * self.sectors_per_cluster as u64
-                    * self.bytes_per_sector as u64;
-            self.file.seek(SeekFrom::Start(cluster_offset))?;
-            let mut buf =
-                vec![0u8; self.sectors_per_cluster as usize * self.bytes_per_sector as usize];
-            self.file.read_exact(&mut buf)?;
-            for i in 0..(buf.len() / 32) {
-                let entry = &mut buf[i * 32..(i + 1) * 32];
-                let high = u16::from_le_bytes([entry[20], entry[21]]) as u32;
-                let low = u16::from_le_bytes([entry[26], entry[27]]) as u32;
-                let cl = (high << 16) | low;
-                if cl == start_cluster {
-                    entry[28..32].copy_from_slice(&new_size.to_le_bytes());
-                    // Записываем обратно
-                    self.file
-                        .seek(SeekFrom::Start(cluster_offset + (i * 32) as u64))?;
-                    self.file.write_all(entry)?;
-                    return Ok(());
-                }
-            }
-            dir_cluster = self.get_fat_entry(dir_cluster);
-            if dir_cluster >= 0x0FFFFFF8 {
-                break;
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "dir entry not found",
-        ))
-    }
-
     fn create_entry_lfn(
         &mut self,
         name: &str,
@@ -269,25 +620,27 @@ impl Fat32Volume {
         if entries.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
             return Ok(None);
         }
-        let (base, ext) = generate_short_name(
+        let short_name = generate_short_name(
             name,
             &entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
         );
-        let mut short_name = [b' '; 11];
-        for (i, b) in base.as_bytes().iter().take(8).enumerate() {
-            short_name[i] = *b;
-        }
-        for (i, b) in ext.as_bytes().iter().take(3).enumerate() {
-            short_name[8 + i] = *b;
-        }
-        let checksum = lfn_checksum(&short_name);
+        let _checksum = lfn_checksum(&short_name);
 
-        let new_cluster = self
-            .find_free_cluster()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Нет свободных кластеров"))?;
-        self.set_fat_entry(new_cluster, 0x0FFFFFFF);
+        // Для файлов НЕ выделяем кластер сразу, он будет выделен при записи
+        // Для директорий выделяем кластер сразу, так как нужно инициализировать . и ..
+        let new_cluster = if attr == 0x10 {
+            // Директория - выделяем кластер
+            let cluster = self
+                .find_free_cluster()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Нет свободных кластеров"))?;
+            self.set_fat_entry(cluster, 0x0FFFFFFF);
+            cluster
+        } else {
+            // Файл - не выделяем кластер, используем 0
+            0
+        };
 
-        let lfn_entries = make_lfn_entries(name, checksum);
+        let lfn_entries = make_lfn_entries(name, &short_name);
 
         let mut dir_entry = [0u8; 32];
         dir_entry[0..8].copy_from_slice(&short_name[0..8]);
@@ -302,14 +655,275 @@ impl Fat32Volume {
         Ok(Some(new_cluster))
     }
 
-    pub fn create_file_lfn(&mut self, filename: &str) -> io::Result<bool> {
+    /// Находит директорию по пути и возвращает её кластер
+    pub fn find_directory(&mut self, path: &str) -> io::Result<Option<u32>> {
+        // Нормализуем путь
+        let path_normalized = path.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if parts.is_empty() {
+            return Ok(Some(self.root_cluster));
+        }
+
+        let mut current_cluster = self.root_cluster;
+
+        for part in parts {
+            let entries = self.list_directory(current_cluster)?;
+            let mut found = false;
+
+            // Пробуем найти точное совпадение или совпадение без учёта регистра
+            for entry in &entries {
+                let entry_name = entry.name.trim();
+
+                // Проверяем разные варианты имени:
+                // 1. Точное совпадение без учёта регистра
+                // 2. Совпадение с подчёркиванием вместо пробелов
+                // 3. Совпадение коротких имён 8.3
+                if entry.is_directory
+                    && (entry_name.eq_ignore_ascii_case(part) ||
+                    entry_name.replace('_', " ").eq_ignore_ascii_case(part) ||
+                    entry_name.replace(' ', "_").eq_ignore_ascii_case(part) ||
+                    // Проверяем короткое имя 8.3 (если длинное имя обрезано)
+                    (part.len() > 8 && entry_name.eq_ignore_ascii_case(&part[..8.min(part.len())])))
+                {
+                    current_cluster = entry.start_cluster;
+                    found = true;
+                    log::debug!("Found directory '{}' as '{}'", part, entry_name);
+                    break;
+                }
+            }
+
+            if !found {
+                log::debug!(
+                    "Directory '{}' not found in cluster {}",
+                    part,
+                    current_cluster
+                );
+                log::debug!(
+                    "Available entries: {:?}",
+                    entries
+                        .iter()
+                        .filter(|e| e.is_directory)
+                        .map(|e| e.name.clone())
+                        .collect::<Vec<_>>()
+                );
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(current_cluster))
+    }
+
+    /// Создаёт директории по пути (mkdir -p)
+    pub fn create_directory_path(&mut self, path: &str) -> io::Result<bool> {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        if parts.is_empty() {
+            return Ok(true); // Корневая директория уже существует
+        }
+
+        // На Windows пытаемся сначала использовать Windows API для создания директорий
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+
+            // Пробуем создать всю структуру директорий через Windows API
+            if let Err(e) = crate::platform::windows::create_directory_on_esp(Path::new(path)) {
+                log::warn!(
+                    "create_directory_on_esp failed for {}, falling back to raw write: {}",
+                    path,
+                    e
+                );
+            } else {
+                log::info!("Created directory path {} via Windows API", path);
+                // После успешного создания через Windows API обновляем все кеши
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after directory creation: {}", e);
+                }
+                return Ok(true);
+            }
+        }
+
+        // Fallback на raw метод для не-Windows или если Windows API не работает
+        let mut current_cluster = self.root_cluster;
+
+        for part in parts {
+            let entries = self.list_directory(current_cluster)?;
+            let mut found = false;
+
+            for entry in entries {
+                if entry.name.trim().eq_ignore_ascii_case(part) && entry.is_directory {
+                    current_cluster = entry.start_cluster;
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                // Создаём директорию
+                if let Some(new_cluster) = self.create_entry_lfn(part, 0x10, current_cluster)? {
+                    // Инициализируем новую директорию с . и ..
+                    let cluster_size =
+                        self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+                    let mut buf = vec![0u8; cluster_size];
+
+                    // Запись "."
+                    let mut dot_entry = [b' '; 32];
+                    dot_entry[0] = b'.';
+                    dot_entry[11] = 0x10; // атрибут директории
+                    dot_entry[20..22].copy_from_slice(&((new_cluster >> 16) as u16).to_le_bytes());
+                    dot_entry[26..28].copy_from_slice(&(new_cluster as u16).to_le_bytes());
+
+                    // Запись ".."
+                    let mut dotdot_entry = [b' '; 32];
+                    dotdot_entry[0] = b'.';
+                    dotdot_entry[1] = b'.';
+                    dotdot_entry[11] = 0x10; // атрибут директории
+                    dotdot_entry[20..22]
+                        .copy_from_slice(&((current_cluster >> 16) as u16).to_le_bytes());
+                    dotdot_entry[26..28].copy_from_slice(&(current_cluster as u16).to_le_bytes());
+
+                    // Копируем записи в буфер
+                    buf[0..32].copy_from_slice(&dot_entry);
+                    buf[32..64].copy_from_slice(&dotdot_entry);
+
+                    let cluster_offset =
+                        self.data_offset + (new_cluster as u64 - 2) * cluster_size as u64;
+                    self.file.seek(SeekFrom::Start(cluster_offset))?;
+                    self.file.write_all(&buf)?;
+                    self.flush_fat()?;
+
+                    current_cluster = new_cluster;
+                } else {
+                    return Ok(false); // Не удалось создать директорию
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Создаёт файл по пути (с созданием директорий если необходимо)
+    pub fn create_file_with_path(&mut self, path: &str) -> io::Result<bool> {
+        // Разделяем путь на директории и имя файла
+        let path_normalized = path.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if parts.is_empty() {
+            return Ok(false);
+        }
+
+        let filename = parts.last().unwrap();
+        let dir_path = if parts.len() > 1 {
+            parts[..parts.len() - 1].join("/")
+        } else {
+            String::new()
+        };
+
+        // Создаём директории если нужно
+        if !dir_path.is_empty() {
+            self.create_directory_path(&dir_path)?;
+        }
+
+        // Находим родительскую директорию
+        let parent_cluster = if dir_path.is_empty() {
+            self.root_cluster
+        } else {
+            self.find_directory(&dir_path)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Parent directory not found")
+            })?
+        };
+
+        // На Windows используем write_file_to_esp для создания пустого файла
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+
+            // Проверяем, существует ли файл
+            let entries = self.list_directory(parent_cluster)?;
+            for entry in entries {
+                if entry.name.trim().eq_ignore_ascii_case(filename) {
+                    return Ok(false); // Файл уже существует
+                }
+            }
+
+            // Создаём пустой файл через write_file_to_esp
+            match crate::platform::windows::write_file_to_esp(Path::new(path), b"") {
+                Ok(_) => {
+                    log::info!("Created file {} via write_file_to_esp", path);
+                    // После успешной записи через Windows API обновляем все кеши
+                    if let Err(e) = self.refresh_all_caches() {
+                        log::warn!("Failed to refresh caches after file creation: {}", e);
+                    }
+                    return Ok(true);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create file via write_file_to_esp: {}, falling back to raw",
+                        e
+                    );
+                    // Падаем на raw метод
+                }
+            }
+        }
+
+        // Fallback на raw метод для не-Windows или если write_file_to_esp не работает
         Ok(self
-            .create_entry_lfn(filename, 0x20, self.root_cluster)?
+            .create_entry_lfn(filename, 0x20, parent_cluster)?
             .is_some())
     }
 
+    pub fn create_file_lfn(&mut self, filename: &str) -> io::Result<bool> {
+        self.create_file_with_path(filename)
+    }
+
     pub fn delete_file_lfn(&mut self, filename: &str) -> io::Result<bool> {
-        let mut dir_cluster = self.root_cluster;
+        // На Windows пытаемся сначала использовать Windows API для удаления
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+
+            // Пробуем удалить через Windows API
+            if let Err(e) = crate::platform::windows::delete_file_from_esp(Path::new(filename)) {
+                log::warn!(
+                    "delete_file_from_esp failed for {}, falling back to raw delete: {}",
+                    filename,
+                    e
+                );
+            } else {
+                log::info!("Deleted file {} via Windows API", filename);
+                // После успешного удаления через Windows API обновляем все кеши
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after file deletion: {}", e);
+                }
+                return Ok(true);
+            }
+        }
+
+        // Нормализуем путь и вычисляем директорию-родителя и имя файла
+        let path_normalized = filename.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(false);
+        }
+        let target_name = parts.last().unwrap().trim().to_string();
+        let mut dir_cluster = if parts.len() > 1 {
+            let dir_path = parts[..parts.len() - 1].join("/");
+            match self.find_directory(&dir_path)? {
+                Some(c) => c,
+                None => return Ok(false),
+            }
+        } else {
+            self.root_cluster
+        };
+
+        // Raw удаление в пределах найденной директории
         loop {
             let cluster_offset = self.data_offset
                 + (dir_cluster as u64 - 2)
@@ -353,7 +967,7 @@ impl Fat32Volume {
                     } else {
                         _short_name.clone()
                     };
-                    if full_name.eq_ignore_ascii_case(filename) {
+                    if full_name.trim().eq_ignore_ascii_case(&target_name) {
                         // 1. Освобождаем цепочку кластеров
                         let mut cl = start_cluster;
                         while cl < 0x0FFFFFF8 && cl != 0 {
@@ -418,7 +1032,46 @@ impl Fat32Volume {
     }
 
     pub fn delete_dir_lfn(&mut self, dirname: &str) -> io::Result<bool> {
-        let mut dir_cluster = self.root_cluster;
+        // На Windows пытаемся сначала использовать Windows API для удаления
+        #[cfg(windows)]
+        {
+            use std::path::Path;
+
+            // Пробуем удалить через Windows API
+            if let Err(e) = crate::platform::windows::delete_directory_from_esp(Path::new(dirname)) {
+                log::warn!(
+                    "delete_directory_from_esp failed for {}, falling back to raw delete: {}",
+                    dirname,
+                    e
+                );
+            } else {
+                log::info!("Deleted directory {} via Windows API", dirname);
+                // После успешного удаления через Windows API обновляем все кеши
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after directory deletion: {}", e);
+                }
+                return Ok(true);
+            }
+        }
+
+        // Нормализуем путь, определяем родителя и целевое имя каталога
+        let path_normalized = dirname.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(false);
+        }
+        let target_name = parts.last().unwrap().trim().to_string();
+        let mut dir_cluster = if parts.len() > 1 {
+            let parent_path = parts[..parts.len() - 1].join("/");
+            match self.find_directory(&parent_path)? {
+                Some(c) => c,
+                None => return Ok(false),
+            }
+        } else {
+            self.root_cluster
+        };
+
+        // Raw удаление каталога в пределах найденной директории
         loop {
             let cluster_offset = self.data_offset
                 + (dir_cluster as u64 - 2)
@@ -461,7 +1114,7 @@ impl Fat32Volume {
                         _short_name.clone()
                     };
                     let attr = buf[j * 32 + 11];
-                    if full_name.eq_ignore_ascii_case(dirname) && (attr & 0x10) != 0 {
+                    if full_name.trim().eq_ignore_ascii_case(&target_name) && (attr & 0x10) != 0 {
                         // Проверяем, пуста ли директория
                         let entries = self.list_directory(start_cluster)?;
                         let only_dot = entries.iter().all(|e| e.name == "." || e.name == "..");
@@ -578,6 +1231,43 @@ impl Fat32Volume {
         Ok(true)
     }
 
+    #[cfg(windows)]
+    fn write_data_with_retry(&mut self, data: &[u8]) -> io::Result<()> {
+        // Сначала пробуем обычную запись
+        match self.file.write_all(data) {
+            Ok(_) => return Ok(()),
+            Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // Если получили ACCESS_DENIED, применяем стратегии из прототипа
+                log::warn!("Got ACCESS_DENIED, trying advanced ESP writing strategies");
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Стратегии записи для ESP на Windows (из прототипа)
+        use crate::platform::windows::write_file_to_esp;
+        use std::path::Path;
+        use uuid::Uuid;
+
+        // Создаем временный файл для данных
+        let tmp_filename = format!("tmp-{}.bin", Uuid::new_v4());
+        let tmp_path = Path::new(&tmp_filename);
+
+        // Используем write_file_to_esp для записи временных данных
+        match write_file_to_esp(tmp_path, data) {
+            Ok(_) => {
+                log::info!("Successfully wrote data using ESP writing strategies");
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("Failed to write data using ESP strategies: {}", e);
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("ESP write failed: {}", e),
+                ))
+            }
+        }
+    }
+
     pub fn open_esp<P: AsRef<str>>(path: Option<P>) -> io::Result<Option<Fat32Volume>> {
         if let Some(p) = path {
             // Открываем указанный образ или устройство
@@ -625,7 +1315,7 @@ impl Fat32Volume {
             )
             .map(Some)
         } else {
-            match find_esp_device()? {
+            match find_esp_device().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
                 Some((path, lba)) => {
                     let mut file = File::open(&path)?;
 
@@ -667,7 +1357,8 @@ impl Fat32Volume {
                         ));
                     }
 
-                    Fat32Volume::open(
+                    #[cfg_attr(not(windows), allow(unused_mut))]
+                    let mut volume = Fat32Volume::open(
                         true, // sync_on_write = true для реальных устройств (безопаснее)
                         &path,
                         lba, // LBA
@@ -677,11 +1368,223 @@ impl Fat32Volume {
                         params.num_fats as u32,
                         params.sectors_per_fat,
                         params.root_cluster,
-                    )
-                    .map(Some)
+                    )?;
+
+                    // На Windows пытаемся получить Volume path для ESP
+                    #[cfg(windows)]
+                    {
+                        if let Some(vol_path) = crate::platform::windows::find_esp_volume_path() {
+                            volume.volume_path = Some(vol_path);
+                            log::info!("ESP volume path set: {:?}", volume.volume_path);
+                        }
+                    }
+
+                    Ok(Some(volume))
                 }
                 None => Ok(None),
             }
         }
+    }
+
+    // Вспомогательный метод для обновления размера файла в директории по стартовому кластеру
+    #[allow(dead_code)]
+    fn update_file_size_in_dir(
+        &mut self,
+        dir_cluster: u32,
+        start_cluster: u32,
+        new_size: u32,
+    ) -> io::Result<()> {
+        let mut dir_data = self.read_chain(dir_cluster)?;
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let entries_per_cluster = cluster_size / 32;
+
+        for cluster_idx in 0..dir_data.len() / cluster_size {
+            let cluster_offset = cluster_idx * cluster_size;
+
+            for i in 0..entries_per_cluster {
+                let offset = cluster_offset + i * 32;
+                if offset + 32 > dir_data.len() {
+                    break;
+                }
+
+                let entry = &dir_data[offset..offset + 32];
+                if entry[0] == 0x00 {
+                    break; // Конец директории
+                }
+                if entry[0] == 0xE5 || entry[11] == 0x0F {
+                    continue; // Удаленная запись или LFN
+                }
+
+                // Проверяем стартовый кластер (FAT32: high 16 bits at 20..21, low 16 bits at 26..27)
+                let high = u16::from_le_bytes([entry[20], entry[21]]) as u32;
+                let low = u16::from_le_bytes([entry[26], entry[27]]) as u32;
+                let entry_start_cluster = (high << 16) | low;
+
+                if entry_start_cluster == start_cluster {
+                    // Обновляем размер файла
+                    dir_data[offset + 28] = (new_size & 0xFF) as u8;
+                    dir_data[offset + 29] = ((new_size >> 8) & 0xFF) as u8;
+                    dir_data[offset + 30] = ((new_size >> 16) & 0xFF) as u8;
+                    dir_data[offset + 31] = ((new_size >> 24) & 0xFF) as u8;
+
+                    // Записываем обновленные данные обратно
+                    self.write_chain(dir_cluster, &dir_data)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "File entry not found in directory",
+        ))
+    }
+
+    // Вспомогательный метод для обновления размера и кластера файла по имени
+    fn update_file_size_in_dir_by_name(
+        &mut self,
+        dir_cluster: u32,
+        filename: &str,
+        new_size: u32,
+        new_start_cluster: Option<u32>,
+    ) -> io::Result<()> {
+        let mut dir_data = self.read_chain(dir_cluster)?;
+        let cluster_size = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
+        let entries_per_cluster = cluster_size / 32;
+
+        let filename_upper = filename.to_uppercase();
+        let mut lfn_entries = Vec::new();
+
+        for cluster_idx in 0..dir_data.len() / cluster_size {
+            let cluster_offset = cluster_idx * cluster_size;
+
+            for i in 0..entries_per_cluster {
+                let offset = cluster_offset + i * 32;
+                if offset + 32 > dir_data.len() {
+                    break;
+                }
+
+                let entry = &dir_data[offset..offset + 32];
+                if entry[0] == 0x00 {
+                    break; // Конец директории
+                }
+                if entry[0] == 0xE5 {
+                    lfn_entries.clear();
+                    continue; // Удаленная запись
+                }
+
+                if entry[11] == 0x0F {
+                    // LFN запись
+                    lfn_entries.push(entry.to_vec());
+                } else {
+                    // Обычная запись - проверяем имя
+                    let mut short_name = String::new();
+
+                    // Имя (первые 8 байт)
+                    for j in 0..8 {
+                        if entry[j] != 0x20 {
+                            short_name.push(entry[j] as char);
+                        }
+                    }
+
+                    // Расширение (байты 8-10)
+                    let mut has_ext = false;
+                    for j in 8..11 {
+                        if entry[j] != 0x20 {
+                            if !has_ext {
+                                short_name.push('.');
+                                has_ext = true;
+                            }
+                            short_name.push(entry[j] as char);
+                        }
+                    }
+
+                    // Проверяем LFN если есть
+                    let mut full_name = String::new();
+                    if !lfn_entries.is_empty() {
+                        // Собираем LFN из записей
+                        lfn_entries.reverse();
+                        for lfn_entry in &lfn_entries {
+                            // Извлекаем символы из LFN записи
+                            for j in 0..5 {
+                                let ch = (lfn_entry[1 + j * 2] as u16)
+                                    | ((lfn_entry[2 + j * 2] as u16) << 8);
+                                if ch != 0 && ch != 0xFFFF {
+                                    if let Some(c) = char::from_u32(ch as u32) {
+                                        full_name.push(c);
+                                    }
+                                }
+                            }
+                            for j in 0..6 {
+                                let ch = (lfn_entry[14 + j * 2] as u16)
+                                    | ((lfn_entry[15 + j * 2] as u16) << 8);
+                                if ch != 0 && ch != 0xFFFF {
+                                    if let Some(c) = char::from_u32(ch as u32) {
+                                        full_name.push(c);
+                                    }
+                                }
+                            }
+                            for j in 0..2 {
+                                let ch = (lfn_entry[28 + j * 2] as u16)
+                                    | ((lfn_entry[29 + j * 2] as u16) << 8);
+                                if ch != 0 && ch != 0xFFFF {
+                                    if let Some(c) = char::from_u32(ch as u32) {
+                                        full_name.push(c);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        full_name = short_name.clone();
+                    }
+
+                    // Сравниваем имена
+                    if full_name.to_uppercase() == filename_upper || short_name == filename_upper {
+                        // Обновляем размер файла только если передано не u32::MAX
+                        if new_size != u32::MAX {
+                            dir_data[offset + 28] = (new_size & 0xFF) as u8;
+                            dir_data[offset + 29] = ((new_size >> 8) & 0xFF) as u8;
+                            dir_data[offset + 30] = ((new_size >> 16) & 0xFF) as u8;
+                            dir_data[offset + 31] = ((new_size >> 24) & 0xFF) as u8;
+                        }
+
+                        // Обновляем стартовый кластер если нужно (FAT32: high 16 bits at 20..21, low 16 bits at 26..27)
+                        if let Some(cluster) = new_start_cluster {
+                            let high: u16 = (cluster >> 16) as u16;
+                            let low: u16 = (cluster & 0xFFFF) as u16;
+                            let high_bytes = high.to_le_bytes();
+                            let low_bytes = low.to_le_bytes();
+                            dir_data[offset + 20] = high_bytes[0];
+                            dir_data[offset + 21] = high_bytes[1];
+                            dir_data[offset + 26] = low_bytes[0];
+                            dir_data[offset + 27] = low_bytes[1];
+                        }
+
+                        // Записываем обновленные данные обратно
+                        self.write_chain(dir_cluster, &dir_data)?;
+                        return Ok(());
+                    }
+
+                    lfn_entries.clear();
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("File '{}' not found in directory", filename),
+        ))
+    }
+
+    // Вспомогательный метод для обновления стартового кластера файла
+    fn update_file_start_cluster_in_dir(
+        &mut self,
+        dir_cluster: u32,
+        filename: &str,
+        new_start_cluster: u32,
+    ) -> io::Result<()> {
+        // Передаём u32::MAX как специальное значение, чтобы не обновлять размер
+        self.update_file_size_in_dir_by_name(dir_cluster, filename, u32::MAX, Some(new_start_cluster))?;
+        Ok(())
     }
 }
