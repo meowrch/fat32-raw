@@ -1,6 +1,6 @@
 [package]
 name = "fat32-raw"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["DIMFLIX <dimflix.official@gmail.com>"]
 description = "Cross-platform Rust library for direct FAT32 partition manipulation with ESP support"

@@ -1,75 +1,90 @@
-# fat32-raw 🚀
+<div align="center">
+	<h1> FAT32-Raw 🚀</h1>
+	<a href="https://github.com/meowrch/fat32-raw/issues">
+		<img src="https://img.shields.io/github/issues/meowrch/fat32-raw?color=ffb29b&labelColor=1C2325&style=for-the-badge">
+	</a>
+	<a href="https://github.com/meowrch/fat32-raw/stargazers">
+		<img src="https://img.shields.io/github/stars/meowrch/fat32-raw?color=fab387&labelColor=1C2325&style=for-the-badge">
+	</a>
+	<a href="./LICENSE">
+		<img src="https://img.shields.io/github/license/meowrch/fat32-raw?color=FCA2AA&labelColor=1C2325&style=for-the-badge">
+	</a>
+    <br>
+	<br>
+	<a href="./README.ru.md">
+		<img src="https://img.shields.io/badge/README-RU-blue?color=cba6f7&labelColor=1C2325&style=for-the-badge">
+	</a>
+	<a href="./README.md">
+		<img src="https://img.shields.io/badge/README-ENG-blue?color=C9CBFF&labelColor=C9CBFF&style=for-the-badge">
+	</a>
+</div>
 
-[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-blue?style=for-the-badge)]()
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0)
+A fully featured Rust library for direct work with FAT32 partitions and images. Provides low-level access to the FAT32 file system with support for reading, writing, creating and deleting files and directories.
 
-Полнофункциональная Rust-библиотека для прямой работы с FAT32-разделами и образами. Обеспечивает низкоуровневый доступ к файловой системе FAT32 с поддержкой чтения, записи, создания и удаления файлов и директорий.
+## ✨ Key features
 
-## ✨ Ключевые особенности
+### 🎯 Core capabilities
+- **Direct partition access**: Native support for ESP (EFI System Partition), SD cards, USB flash drives
+- **Cross‑platform**: Full support for Windows and Linux with handling of OS‑specific nuances
+- **Full FAT32 feature set**: Read, write, create, delete files and directories
+- **Nested directories**: Support for creating and navigating deeply nested directory structures
+- **Long file names (LFN)**: Full Unicode name support up to 255 characters
+- **Auto parameter detection**: Automatic parsing of BPB (BIOS Parameter Block)
 
-### 🎯 Основные возможности
-- **Прямая работа с разделами**: Нативная поддержка ESP (EFI System Partition), SD-карт, USB-флешек
-- **Кроссплатформенность**: Полная поддержка Windows и Linux с обработкой специфичных для ОС особенностей
-- **Полный функционал FAT32**: Чтение, запись, создание, удаление файлов и директорий
-- **Вложенные директории**: Поддержка создания и навигации по глубоко вложенным структурам каталогов
-- **Длинные имена файлов (LFN)**: Полная поддержка Unicode-имён до 255 символов
-- **Автоопределение параметров**: Автоматический разбор BPB (BIOS Parameter Block)
+### 🔧 Technical advantages
+- **Safety**: Minimal use of `unsafe` code, strong typing
+- **Performance**: Optimized read/write operations with buffering
+- **Reliability**: Proper error handling, protection against data corruption
+- **Windows specifics**: Solves access rights issues (OS Error 5) via special file opening flags
 
-### 🔧 Технические преимущества
-- **Безопасность**: Минимальное использование `unsafe` кода, строгая типизация
-- **Производительность**: Оптимизированные операции чтения/записи с буферизацией
-- **Надёжность**: Корректная обработка ошибок, защита от повреждения данных
-- **Windows-специфика**: Решение проблем с правами доступа (OS Error 5) через специальные флаги открытия файлов
+## 🚀 Quick start
 
-## 🚀 Быстрый старт
-
-### Работа с образом диска
+### Working with a disk image
 ```rust
 use fat32_raw::Fat32Volume;
 
 fn main() -> std::io::Result<()> {
-    // Открываем FAT32-образ
+    // Open a FAT32 image
     let mut volume = Fat32Volume::open_esp(Some("esp.img"))?
-        .expect("Не удалось открыть FAT32-образ");
+        .expect("Failed to open FAT32 image");
 
-    // Создаём директории
+    // Create directories
     volume.create_dir_lfn("config")?;
     
-    // Создаём и записываем файл
+    // Create and write a file
     volume.create_file_lfn("test.txt")?;
     let content = b"Hello from fat32-raw!";
     volume.write_file("test.txt", content)?;
     
-    // Читаем файл обратно
+    // Read the file back
     if let Some(data) = volume.read_file("test.txt")? {
-        println!("Содержимое: {}", String::from_utf8_lossy(&data));
+        println!("Content: {}", String::from_utf8_lossy(&data));
     }
     
-    // Удаляем файл
+    // Delete the file
     volume.delete_file_lfn("test.txt")?;
     
     Ok(())
 }
 ```
 
-### Работа с реальным ESP-разделом
+### Working with a real ESP partition
 ```rust
 use fat32_raw::Fat32Volume;
 
 fn main() -> std::io::Result<()> {
-    // Автоматический поиск и открытие ESP-раздела
-    // На Windows требуются права администратора
-    // На Linux может потребоваться sudo
+    // Automatic search and opening of the ESP partition
+    // On Windows, administrator rights are required
+    // On Linux, sudo may be required
     let mut volume = Fat32Volume::open_esp(None::<&str>)?
-        .expect("ESP-раздел не найден");
+        .expect("ESP partition not found");
     
-    // Работаем с разделом так же, как с образом
+    // Work with the partition the same way as with an image
     volume.create_dir_lfn("MyApp")?;
     volume.create_file_lfn("MyApp_config.txt")?;
     volume.write_file("MyApp_config.txt", b"Configuration")?;
     
-    // Перечисляем файлы в корне
+    // List files in the root
     let entries = volume.list_root()?;
     for entry in entries {
         println!("{} - {}", 
@@ -82,99 +97,83 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-## 📦 Установка
+## 📦 Installation
 
-Добавьте в `Cargo.toml`:
+Add to `Cargo.toml`:
 ```toml
 [dependencies]
 fat32-raw = "1.0"
 ```
 
-## 🧪 Тестирование
+## 🧪 Testing
 
-Проект включает набор тестов для проверки всех операций:
+The project includes a test suite that covers all operations:
+
 
 ```bash
-# Запуск обычных тестов
+# Run regular tests
 cargo test
 
-# Запуск тестов на реальном ESP (требует sudo/Administrator)
-# ⨏️ ОСТОРОЖНО: этот тест работает с реальным ESP разделом!
+# Run tests on a real ESP (requires sudo/Administrator)
+# WARNING: this test works with a real ESP partition!
 sudo cargo test --test real_esp_test
 ```
 
-## 🏗️ Структура проекта
+## 🏗️ Project structure
 
 ```
 fat32-raw/
 ├── src/
-│   ├── lib.rs              # Главный модуль библиотеки
-│   ├── error.rs            # Обработка ошибок
+│   ├── lib.rs              # Main library module
+│   ├── error.rs            # Error handling
 │   ├── fat32/
-│   │   ├── mod.rs          # Модуль FAT32
-│   │   ├── volume.rs       # Основная логика работы с томом
-│   │   ├── directory.rs    # Работа с директориями
-│   │   ├── file.rs         # Работа с файлами
-│   │   ├── fat_table.rs    # Работа с FAT-таблицей
-│   │   ├── lfn.rs          # Поддержка длинных имён файлов
-│   │   └── utils.rs        # Вспомогательные функции
+│   │   ├── mod.rs          # FAT32 module
+│   │   ├── volume.rs       # Core volume logic
+│   │   ├── directory.rs    # Directory operations
+│   │   ├── file.rs         # File operations
+│   │   ├── fat_table.rs    # FAT table handling
+│   │   ├── lfn.rs          # Long file name support
+│   │   └── utils.rs        # Helper functions
 │   └── platform/
-│       ├── mod.rs          # Платформенные абстракции
-│       ├── windows/        # Windows-специфичный код
-│       └── unix/           # Unix/Linux-специфичный код
+│       ├── mod.rs          # Platform abstractions
+│       ├── windows/        # Windows‑specific code
+│       └── unix/           # Unix/Linux‑specific code
 └── tests/
-    └── real_esp_test.rs    # Комплексные тесты с реальным ESP
+    └── real_esp_test.rs    # Integration tests with real ESP
 ```
 
-## 🔄 Версия 1.0.0 - Мажорный релиз 🎉
+## 🚧 Roadmap
 
-### 🐛 Исправления для Windows
-- **Решена критическая проблема OS Error 5**: При записи файлов на ESP-раздел в Windows возникала ошибка доступа
-- **Реализовано решение**: Использование специальных флагов `FILE_SHARE_READ | FILE_SHARE_WRITE` при открытии разделов
-- **Улучшена совместимость**: Корректная работа с Windows-специфичными путями (`\\.\PhysicalDriveN`)
+- [X] Support for creating and deleting files and directories  
+- [X] Automatic ESP partition discovery on disks  
+- [X] Working with nested directories  
+- [X] Full integration with Windows and Linux  
+- [X] Handling access rights issues on Windows  
+- [ ] ⏳ MBR partition support  
+- [ ] ⏳ Defragmentation and optimization  
+- [ ] ⏳ FAT12/FAT16 support  
+- [X] ⏳ Integration with GitHub Actions CI/CD  
 
-### 🏗️ Рефакторинг структуры
-- Реорганизована структура проекта для лучшей модульности
-- Разделен код на платформенно-зависимые и независимые части
-- Улучшена структура модуля FAT32 для большей ясности
+## 🤝 Contributing
 
-### ✅ Улучшения тестирования
-- Создан комплексный тест `real_esp_test.rs` для реального ESP
-- Добавлены тесты для вложенных директорий и больших файлов
-- Реализована полная проверка всех операций файловой системы
+Contributions are welcome! Please:
+1. Fork the repository  
+2. Create a branch for your changes  
+3. Make sure all tests pass  
+4. Open a pull request  
 
-## 🚧 Планы развития
+## 📄 License
 
-- [X] Поддержка создания и удаления файлов и директорий  
-- [X] Автоматический поиск ESP раздела на дисках
-- [X] Работа с вложенными директориями  
-- [X] Полная интеграция с Windows и Linux  
-- [X] Решение проблем с правами доступа в Windows
-- [ ] ⏳ Поддержка MBR-разделов
-- [ ] ⏳ Дефрагментация и оптимизация
-- [ ] ⏳ Поддержка FAT12/FAT16
-- [X] ⏳ Интеграция с GitHub Actions CI/CD
+This project is distributed under the [GPLv3](./LICENSE) license.
 
-## 🤝 Вклад в проект
+## 🙏 Acknowledgements
 
-Мы приветствуем вклад в развитие проекта! Пожалуйста:
-1. Форкните репозиторий
-2. Создайте ветку для ваших изменений
-3. Убедитесь, что все тесты проходят
-4. Отправьте pull request
-
-## 📄 Лицензия
-
-Проект распространяется под лицензией [GPLv3](./LICENSE).
-
-## 🙏 Благодарности
-
-- Сообществу Rust за отличные инструменты и документацию
-- Авторам спецификации FAT32 от Microsoft
-- Всем контрибьюторам и пользователям проекта
+- The Rust community for great tools and documentation  
+- The authors of the FAT32 specification from Microsoft  
+- All project contributors and users  
 
 ---
 
 <div align="center">
-Сделано с ❤️ используя Rust
+Made with ❤️ using Rust
 </div>
