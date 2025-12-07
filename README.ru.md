@@ -1,4 +1,5 @@
 <div align="center">
+    <img src=".meta/logo.png" width=300 alt="fat32-raw logo"/>
 	<h1> FAT32-Raw 🚀</h1>
 	<a href="https://github.com/meowrch/fat32-raw/issues">
 		<img src="https://img.shields.io/github/issues/meowrch/fat32-raw?color=ffb29b&labelColor=1C2325&style=for-the-badge">
