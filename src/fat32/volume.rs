@@ -23,6 +23,44 @@ pub fn read_bpb(file: &mut std::fs::File, offset: u64) -> std::io::Result<Fat32P
     })
 }
 
+/// Normalize an explicit device/image path supplied by the caller of
+/// [`Fat32Volume::open_esp`].
+///
+/// On Windows, a Volume GUID path can be written in two forms:
+///   * `\\?\Volume{GUID}`   — the *device* (raw) form, openable via `CreateFileW`
+///   * `\\?\Volume{GUID}\`  — the *filesystem-root* form, **not** openable as a file
+///     (`CreateFileW` returns `ERROR_PATH_NOT_FOUND`)
+///
+/// We accept either form from the caller and normalize to the device form here
+/// so subsequent `std::fs::File::open` succeeds. On non-Windows targets, the
+/// path is returned unchanged.
+///
+/// This is a free function (rather than a method) specifically so it can be
+/// unit-tested without going through the actual file-open path.
+pub fn normalize_explicit_device_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        let mut s = path.to_string();
+        if (s.starts_with("\\\\?\\Volume{") || s.starts_with("\\\\.\\Volume{")) && s.ends_with('\\')
+        {
+            s.pop();
+        }
+        s
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+/// True if `path` looks like a Windows volume GUID path (in either device or
+/// filesystem-root form). Used to decide whether to derive a `volume_path` for
+/// `refresh_all_caches`.
+#[cfg(windows)]
+pub(crate) fn is_volume_guid_path(path: &str) -> bool {
+    path.starts_with("\\\\?\\Volume{") || path.starts_with("\\\\.\\Volume{")
+}
+
 pub struct Fat32Volume {
     sync_on_write: bool,
     file: File,
@@ -32,6 +70,23 @@ pub struct Fat32Volume {
     sectors_per_cluster: u32,
     root_cluster: u32,
     fat: Vec<u8>,
+    /// True when the volume was opened with an explicit device path supplied
+    /// by the caller (e.g. `Fat32Volume::open_esp(Some("\\\\?\\Volume{GUID}"))`).
+    ///
+    /// On Windows, when set, the high-level helpers in `write_file_with_path`,
+    /// `create_directory_path`, `create_file_with_path`, `delete_file_lfn`,
+    /// `delete_dir_lfn`, and `write_data_with_retry` MUST NOT short-circuit
+    /// through `crate::platform::windows::*_to_esp`/`*_from_esp`, because those
+    /// helpers always re-discover the ESP via `find_esp_volume_path()` and
+    /// therefore ignore the device the caller asked for. On systems with
+    /// multiple ESPs (e.g. dual-boot Windows + Linux on separate disks) this
+    /// caused operations to silently target the wrong ESP.
+    ///
+    /// Currently consulted only on Windows (raw fallbacks on Linux do not use
+    /// any auto-detect helpers), but kept on all platforms so the field can be
+    /// set unconditionally in `open_esp`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    explicit_device: bool,
     #[cfg(windows)]
     volume_path: Option<std::path::PathBuf>, // Путь к Volume для Windows (\\?\Volume{GUID}\)
 }
@@ -88,9 +143,20 @@ impl Fat32Volume {
             sectors_per_cluster,
             root_cluster,
             fat,
+            explicit_device: false, // Will be set to true in open_esp if a device path was supplied
             #[cfg(windows)]
             volume_path: None, // Will be set in open_esp if needed
         })
+    }
+
+    /// Returns `true` if this volume was opened with an explicit device path
+    /// supplied by the caller (i.e. via `Fat32Volume::open_esp(Some(path))`).
+    ///
+    /// When this is `true`, the high-level helpers on this struct deliberately
+    /// avoid the auto-detect Windows ESP API to ensure operations target the
+    /// caller-specified volume — important on systems with multiple ESPs.
+    pub fn is_explicit_device(&self) -> bool {
+        self.explicit_device
     }
 
     /// Обновляет кеш FAT из файловой системы (перечитывает FAT таблицу с диска)
@@ -349,9 +415,12 @@ impl Fat32Volume {
 
     /// Записывает файл по пути (с созданием директорий если необходимо)
     pub fn write_file_with_path(&mut self, path: &str, new_content: &[u8]) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать filesystem-based write
+        // На Windows пытаемся сначала использовать filesystem-based write,
+        // НО только если у нас нет явно указанного устройства. Иначе
+        // `write_file_to_esp` авто-задетектит ESP через `find_esp_volume_path()`
+        // и запишет файл на не тот раздел (см. поле `explicit_device`).
         #[cfg(windows)]
-        {
+        if !self.explicit_device {
             use std::path::Path;
 
             // Создаём директории если нужно
@@ -414,6 +483,13 @@ impl Fat32Volume {
 
                 return Ok(true);
             }
+        }
+
+        #[cfg(windows)]
+        if self.explicit_device {
+            log::debug!(
+                "write_file_with_path: explicit device set, skipping Windows ESP API and using raw FAT32 write"
+            );
         }
 
         // Разделяем путь на директории и имя файла
@@ -725,9 +801,11 @@ impl Fat32Volume {
             return Ok(true); // Корневая директория уже существует
         }
 
-        // На Windows пытаемся сначала использовать Windows API для создания директорий
+        // На Windows пытаемся сначала использовать Windows API для создания директорий,
+        // НО только если устройство НЕ указано явно. Иначе `create_directory_on_esp`
+        // создаст директорию через `find_esp_volume_path()` (авто-детект, не тот раздел).
         #[cfg(windows)]
-        {
+        if !self.explicit_device {
             use std::path::Path;
 
             // Пробуем создать всю структуру директорий через Windows API
@@ -840,9 +918,10 @@ impl Fat32Volume {
             })?
         };
 
-        // На Windows используем write_file_to_esp для создания пустого файла
+        // На Windows используем write_file_to_esp для создания пустого файла,
+        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
         #[cfg(windows)]
-        {
+        if !self.explicit_device {
             use std::path::Path;
 
             // Проверяем, существует ли файл
@@ -884,9 +963,10 @@ impl Fat32Volume {
     }
 
     pub fn delete_file_lfn(&mut self, filename: &str) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать Windows API для удаления
+        // На Windows пытаемся сначала использовать Windows API для удаления,
+        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
         #[cfg(windows)]
-        {
+        if !self.explicit_device {
             use std::path::Path;
 
             // Пробуем удалить через Windows API
@@ -1032,9 +1112,10 @@ impl Fat32Volume {
     }
 
     pub fn delete_dir_lfn(&mut self, dirname: &str) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать Windows API для удаления
+        // На Windows пытаемся сначала использовать Windows API для удаления,
+        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
         #[cfg(windows)]
-        {
+        if !self.explicit_device {
             use std::path::Path;
 
             // Пробуем удалить через Windows API
@@ -1243,6 +1324,19 @@ impl Fat32Volume {
             Err(e) => return Err(e),
         }
 
+        // Если устройство задано явно, нельзя использовать `write_file_to_esp` —
+        // он использует `find_esp_volume_path()` (авто-детект) и в системах с
+        // несколькими ESP запишет данные не туда. Возвращаем ошибку.
+        if self.explicit_device {
+            log::error!(
+                "write_data_with_retry: ACCESS_DENIED on explicit device; cannot fall back to auto-detect ESP API"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Access denied writing to explicit ESP device; auto-detect fallback disabled to avoid writing to a different ESP",
+            ));
+        }
+
         // Стратегии записи для ESP на Windows (из прототипа)
         use crate::platform::windows::write_file_to_esp;
         use std::path::Path;
@@ -1271,7 +1365,22 @@ impl Fat32Volume {
     pub fn open_esp<P: AsRef<str>>(path: Option<P>) -> io::Result<Option<Fat32Volume>> {
         if let Some(p) = path {
             // Открываем указанный образ или устройство
-            let path_str = p.as_ref();
+            //
+            // On Windows, normalize volume GUID paths: strip a trailing backslash.
+            // "\\?\Volume{GUID}" (no slash)  -> raw volume device, openable as file
+            // "\\?\Volume{GUID}\" (slash)     -> filesystem root, NOT openable as file
+            //                                    (CreateFileW returns ERROR_PATH_NOT_FOUND)
+            // We accept either form from the caller and normalize to the device form.
+            let raw_path = p.as_ref();
+            let normalized = normalize_explicit_device_path(raw_path);
+            #[cfg(windows)]
+            if normalized.len() != raw_path.len() {
+                log::debug!(
+                    "open_esp: stripped trailing backslash from volume GUID path"
+                );
+            }
+            let path_str = normalized.as_str();
+
             let mut file = std::fs::File::open(path_str)?;
             // BPB обычно в самом начале
             let params = read_bpb(&mut file, 0)?;
@@ -1302,7 +1411,8 @@ impl Fat32Volume {
                 ));
             }
 
-            Fat32Volume::open(
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            let mut volume = Fat32Volume::open(
                 false,
                 path_str,
                 0, // lba = 0 для образа
@@ -1312,8 +1422,35 @@ impl Fat32Volume {
                 params.num_fats as u32,
                 params.sectors_per_fat,
                 params.root_cluster,
-            )
-            .map(Some)
+            )?;
+
+            // Mark this volume as having an explicit device path. The high-level
+            // `write_file_with_path` / `create_directory_path` / etc. helpers must
+            // NOT short-circuit through `crate::platform::windows::*_to_esp` when
+            // this is set, because those helpers always re-discover the ESP via
+            // `find_esp_volume_path()` (auto-detect) and would silently target the
+            // wrong ESP on multi-disk systems.
+            volume.explicit_device = true;
+
+            // On Windows, derive the filesystem-root form of the volume path so
+            // that `refresh_all_caches` (which uses CreateFileW with the device
+            // form) and any future filesystem-API users have a consistent value.
+            #[cfg(windows)]
+            {
+                if is_volume_guid_path(path_str) {
+                    let mut vp = path_str.to_string();
+                    if !vp.ends_with('\\') {
+                        vp.push('\\');
+                    }
+                    volume.volume_path = Some(std::path::PathBuf::from(vp));
+                    log::info!(
+                        "ESP volume path set from explicit device: {:?}",
+                        volume.volume_path
+                    );
+                }
+            }
+
+            Ok(Some(volume))
         } else {
             match find_esp_device().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
                 Some((path, lba)) => {
@@ -1586,5 +1723,101 @@ impl Fat32Volume {
         // Передаём u32::MAX как специальное значение, чтобы не обновлять размер
         self.update_file_size_in_dir_by_name(dir_cluster, filename, u32::MAX, Some(new_start_cluster))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On any platform, paths that are not Windows volume GUID forms must be
+    /// returned verbatim by `normalize_explicit_device_path`.
+    #[test]
+    fn normalize_leaves_non_volume_paths_untouched() {
+        // Unix-style absolute paths are not volume GUIDs.
+        assert_eq!(normalize_explicit_device_path("/dev/sda1"), "/dev/sda1");
+        assert_eq!(
+            normalize_explicit_device_path("/tmp/some-image.img"),
+            "/tmp/some-image.img"
+        );
+        // Empty path is preserved.
+        assert_eq!(normalize_explicit_device_path(""), "");
+    }
+
+    /// On Linux, `normalize_explicit_device_path` must be a no-op even for
+    /// strings that *look* like Windows volume paths (the field separator on
+    /// Linux paths is `/`, so the entire concept of trailing-backslash
+    /// normalization does not apply).
+    #[cfg(not(windows))]
+    #[test]
+    fn normalize_is_noop_on_non_windows_for_volume_like_strings() {
+        let with_slash = "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}\\";
+        let without_slash = "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}";
+        assert_eq!(normalize_explicit_device_path(with_slash), with_slash);
+        assert_eq!(normalize_explicit_device_path(without_slash), without_slash);
+    }
+
+    /// On Windows, a Volume GUID path with a trailing backslash MUST have the
+    /// backslash stripped, so the result is openable as a raw volume device.
+    /// Without this normalization, `std::fs::File::open` returns
+    /// `ERROR_PATH_NOT_FOUND` because the trailing-slash form is the
+    /// filesystem-root view of the volume.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_strips_trailing_backslash_from_question_mark_volume_path() {
+        let input = "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}\\";
+        let expected = "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}";
+        assert_eq!(normalize_explicit_device_path(input), expected);
+    }
+
+    /// `\\.\Volume{...}` is also a valid form and should be normalized too.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_strips_trailing_backslash_from_dot_volume_path() {
+        let input = "\\\\.\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}\\";
+        let expected = "\\\\.\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}";
+        assert_eq!(normalize_explicit_device_path(input), expected);
+    }
+
+    /// A volume GUID path WITHOUT trailing backslash must be returned verbatim,
+    /// since it is already in the device form expected by `CreateFileW`.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_leaves_question_mark_volume_path_without_slash_unchanged() {
+        let input = "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}";
+        assert_eq!(normalize_explicit_device_path(input), input);
+    }
+
+    /// Strings that start with `\\?\` but are NOT volume GUID paths must be
+    /// left alone — stripping a trailing backslash from e.g.
+    /// `\\?\C:\some\dir\` would corrupt the path.
+    #[cfg(windows)]
+    #[test]
+    fn normalize_does_not_touch_non_volume_extended_paths() {
+        let extended_drive = "\\\\?\\C:\\some\\dir\\";
+        assert_eq!(normalize_explicit_device_path(extended_drive), extended_drive);
+
+        let physical_drive = "\\\\.\\PhysicalDrive0";
+        assert_eq!(normalize_explicit_device_path(physical_drive), physical_drive);
+    }
+
+    /// `is_volume_guid_path` recognizes both `\\?\Volume{...}` and
+    /// `\\.\Volume{...}` forms, but rejects other extended-namespace paths.
+    #[cfg(windows)]
+    #[test]
+    fn is_volume_guid_path_recognizes_both_forms() {
+        assert!(is_volume_guid_path(
+            "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}"
+        ));
+        assert!(is_volume_guid_path(
+            "\\\\?\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}\\"
+        ));
+        assert!(is_volume_guid_path(
+            "\\\\.\\Volume{f52171c5-9df4-47f1-9f79-7d0d20ecc4ad}"
+        ));
+        assert!(!is_volume_guid_path("\\\\?\\C:\\some\\dir"));
+        assert!(!is_volume_guid_path("\\\\.\\PhysicalDrive0"));
+        assert!(!is_volume_guid_path("C:\\Windows"));
+        assert!(!is_volume_guid_path(""));
     }
 }

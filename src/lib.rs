@@ -7,6 +7,7 @@ pub mod platform;
 // Re-export main types
 pub use error::{Fat32Error, Result};
 pub use fat32::{volume::Fat32Volume, Fat32FileEntry, Fat32Params};
+pub use fat32::volume::normalize_explicit_device_path;
 
 // Platform-specific re-exports
 #[cfg(windows)]
