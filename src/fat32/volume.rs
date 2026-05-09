@@ -159,6 +159,66 @@ impl Fat32Volume {
         self.explicit_device
     }
 
+    #[cfg(windows)]
+    fn explicit_volume_root(&self) -> io::Result<std::path::PathBuf> {
+        self.volume_path.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "explicit ESP device is set but no filesystem volume root is available",
+            )
+        })
+    }
+
+    #[cfg(windows)]
+    fn try_refresh_after_windows_api(&mut self, operation: &str) {
+        if let Err(e) = self.refresh_all_caches() {
+            log::warn!("Failed to refresh caches after {}: {}", operation, e);
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_file_visibility(&mut self, path: &str) -> io::Result<()> {
+        let path_normalized = path.replace('\\', "/");
+        let parts: Vec<&str> = path_normalized
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let filename = parts.last().copied().unwrap_or("");
+        let parent_cluster = if parts.len() > 1 {
+            let dir_path = parts[..parts.len() - 1].join("/");
+            match self.find_directory(&dir_path)? {
+                Some(cluster) => cluster,
+                None => self.root_cluster,
+            }
+        } else {
+            self.root_cluster
+        };
+
+        for attempt in 0..30 {
+            let entries = self.list_directory(parent_cluster)?;
+            if entries
+                .iter()
+                .any(|e| !e.is_directory && e.name.trim().eq_ignore_ascii_case(filename))
+            {
+                log::info!("File '{}' visible after {} attempt(s)", filename, attempt + 1);
+                return Ok(());
+            }
+            log::debug!(
+                "File '{}' not yet visible (attempt {}/30), sleeping...",
+                filename,
+                attempt + 1
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = self.refresh_fat_cache();
+        }
+
+        log::warn!(
+            "File '{}' not visible after write via Windows API, continuing anyway",
+            filename
+        );
+        Ok(())
+    }
+
     /// Обновляет кеш FAT из файловой системы (перечитывает FAT таблицу с диска)
     pub fn refresh_fat_cache(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(self.fat_offset))?;
@@ -415,10 +475,11 @@ impl Fat32Volume {
 
     /// Записывает файл по пути (с созданием директорий если необходимо)
     pub fn write_file_with_path(&mut self, path: &str, new_content: &[u8]) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать filesystem-based write,
-        // НО только если у нас нет явно указанного устройства. Иначе
-        // `write_file_to_esp` авто-задетектит ESP через `find_esp_volume_path()`
-        // и запишет файл на не тот раздел (см. поле `explicit_device`).
+        // На Windows пытаемся сначала использовать filesystem-based write.
+        // Если устройство задано явно, используем Windows API с тем root, который
+        // указал пользователь (self.volume_path). Если устройство авто-определено,
+        // используем старый write_file_to_esp (он сам найдёт ESP через
+        // find_esp_volume_path()).
         #[cfg(windows)]
         if !self.explicit_device {
             use std::path::Path;
@@ -442,44 +503,8 @@ impl Fat32Volume {
                     e
                 );
             } else {
-                // После успешной записи через Windows API максимально синхронизируемся
-                if let Err(e) = self.refresh_all_caches() {
-                    log::warn!("Failed to refresh caches after write: {}", e);
-                }
-
-                // Подождём, пока файловая система отразит изменения (ESP часто кешируется)
-                let path_normalized = path.replace('\\', "/");
-                let parts: Vec<&str> = path_normalized
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let filename = parts.last().copied().unwrap_or("");
-                let parent_cluster = if parts.len() > 1 {
-                    let dir_path = parts[..parts.len() - 1].join("/");
-                    match self.find_directory(&dir_path)? {
-                        Some(cluster) => cluster,
-                        None => self.root_cluster,
-                    }
-                } else {
-                    self.root_cluster
-                };
-
-                let mut visible = false;
-                for attempt in 0..30 {
-                    let entries = self.list_directory(parent_cluster)?;
-                    if entries.iter().any(|e| !e.is_directory && e.name.trim().eq_ignore_ascii_case(filename)) {
-                        visible = true;
-                        log::info!("File '{}' visible after {} attempt(s)", filename, attempt + 1);
-                        break;
-                    }
-                    log::debug!("File '{}' not yet visible (attempt {}/30), sleeping...", filename, attempt + 1);
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    // Попробуем так же обновить FAT кеш между попытками
-                    let _ = self.refresh_fat_cache();
-                }
-                if !visible {
-                    log::warn!("File '{}' not visible after write via Windows API, continuing anyway", filename);
-                }
+                self.try_refresh_after_windows_api("write");
+                self.wait_for_file_visibility(path)?;
 
                 return Ok(true);
             }
@@ -487,9 +512,36 @@ impl Fat32Volume {
 
         #[cfg(windows)]
         if self.explicit_device {
-            log::debug!(
-                "write_file_with_path: explicit device set, skipping Windows ESP API and using raw FAT32 write"
-            );
+            use std::path::Path;
+            let vol_path = self.explicit_volume_root()?;
+
+            // Создаём директории если нужно
+            let path_normalized = path.replace('\\', "/");
+            let parts: Vec<&str> = path_normalized
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if parts.len() > 1 {
+                let dir_path = parts[..parts.len() - 1].join("/");
+                self.create_directory_path(&dir_path)?;
+            }
+
+            if let Err(e) = crate::platform::windows::write_file_to_esp_with_root(
+                &vol_path,
+                Path::new(path),
+                new_content,
+            ) {
+                log::warn!(
+                    "write_file_to_esp_with_root failed for {}, falling back to raw write: {}",
+                    path,
+                    e
+                );
+            } else {
+                self.try_refresh_after_windows_api("write");
+                self.wait_for_file_visibility(path)?;
+                return Ok(true);
+            }
         }
 
         // Разделяем путь на директории и имя файла
@@ -801,9 +853,9 @@ impl Fat32Volume {
             return Ok(true); // Корневая директория уже существует
         }
 
-        // На Windows пытаемся сначала использовать Windows API для создания директорий,
-        // НО только если устройство НЕ указано явно. Иначе `create_directory_on_esp`
-        // создаст директорию через `find_esp_volume_path()` (авто-детект, не тот раздел).
+        // На Windows пытаемся сначала использовать Windows API для создания директорий.
+        // Если устройство задано явно, используем Windows API с тем root, который
+        // указал пользователь (self.volume_path).
         #[cfg(windows)]
         if !self.explicit_device {
             use std::path::Path;
@@ -817,10 +869,25 @@ impl Fat32Volume {
                 );
             } else {
                 log::info!("Created directory path {} via Windows API", path);
-                // После успешного создания через Windows API обновляем все кеши
-                if let Err(e) = self.refresh_all_caches() {
-                    log::warn!("Failed to refresh caches after directory creation: {}", e);
-                }
+                self.try_refresh_after_windows_api("directory creation");
+                return Ok(true);
+            }
+        } else if let Some(ref vol_path) = self.volume_path {
+            use std::path::Path;
+            let vol_path = vol_path.clone();
+
+            if let Err(e) = crate::platform::windows::create_directory_on_esp_with_root(
+                &vol_path,
+                Path::new(path),
+            ) {
+                log::warn!(
+                    "create_directory_on_esp_with_root failed for {}, falling back to raw write: {}",
+                    path,
+                    e
+                );
+            } else {
+                log::info!("Created directory path {} via Windows API (explicit root)", path);
+                self.try_refresh_after_windows_api("directory creation");
                 return Ok(true);
             }
         }
@@ -918,8 +985,9 @@ impl Fat32Volume {
             })?
         };
 
-        // На Windows используем write_file_to_esp для создания пустого файла,
-        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
+        // На Windows используем write_file_to_esp для создания пустого файла.
+        // Если устройство задано явно, используем Windows API с тем root, который
+        // указал пользователь (self.volume_path).
         #[cfg(windows)]
         if !self.explicit_device {
             use std::path::Path;
@@ -950,6 +1018,32 @@ impl Fat32Volume {
                     // Падаем на raw метод
                 }
             }
+        } else if let Some(ref vol_path) = self.volume_path {
+            use std::path::Path;
+            let vol_path = vol_path.clone();
+
+            let entries = self.list_directory(parent_cluster)?;
+            for entry in entries {
+                if entry.name.trim().eq_ignore_ascii_case(filename) {
+                    return Ok(false);
+                }
+            }
+
+            match crate::platform::windows::write_file_to_esp_with_root(&vol_path, Path::new(path), b"") {
+                Ok(_) => {
+                    log::info!("Created file {} via write_file_to_esp_with_root", path);
+                    if let Err(e) = self.refresh_all_caches() {
+                        log::warn!("Failed to refresh caches after file creation: {}", e);
+                    }
+                    return Ok(true);
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create file via write_file_to_esp_with_root: {}, falling back to raw",
+                        e
+                    );
+                }
+            }
         }
 
         // Fallback на raw метод для не-Windows или если write_file_to_esp не работает
@@ -963,8 +1057,9 @@ impl Fat32Volume {
     }
 
     pub fn delete_file_lfn(&mut self, filename: &str) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать Windows API для удаления,
-        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
+        // На Windows пытаемся сначала использовать Windows API для удаления.
+        // Если устройство задано явно, используем Windows API с тем root, который
+        // указал пользователь (self.volume_path).
         #[cfg(windows)]
         if !self.explicit_device {
             use std::path::Path;
@@ -979,6 +1074,22 @@ impl Fat32Volume {
             } else {
                 log::info!("Deleted file {} via Windows API", filename);
                 // После успешного удаления через Windows API обновляем все кеши
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after file deletion: {}", e);
+                }
+                return Ok(true);
+            }
+        } else if let Some(ref vol_path) = self.volume_path {
+            use std::path::Path;
+
+            if let Err(e) = crate::platform::windows::delete_file_from_esp_with_root(vol_path, Path::new(filename)) {
+                log::warn!(
+                    "delete_file_from_esp_with_root failed for {}, falling back to raw delete: {}",
+                    filename,
+                    e
+                );
+            } else {
+                log::info!("Deleted file {} via Windows API (explicit root)", filename);
                 if let Err(e) = self.refresh_all_caches() {
                     log::warn!("Failed to refresh caches after file deletion: {}", e);
                 }
@@ -1112,8 +1223,9 @@ impl Fat32Volume {
     }
 
     pub fn delete_dir_lfn(&mut self, dirname: &str) -> io::Result<bool> {
-        // На Windows пытаемся сначала использовать Windows API для удаления,
-        // НО только если устройство НЕ задано явно (иначе пойдёт через авто-детект ESP).
+        // На Windows пытаемся сначала использовать Windows API для удаления.
+        // Если устройство задано явно, используем Windows API с тем root, который
+        // указал пользователь (self.volume_path).
         #[cfg(windows)]
         if !self.explicit_device {
             use std::path::Path;
@@ -1128,6 +1240,22 @@ impl Fat32Volume {
             } else {
                 log::info!("Deleted directory {} via Windows API", dirname);
                 // После успешного удаления через Windows API обновляем все кеши
+                if let Err(e) = self.refresh_all_caches() {
+                    log::warn!("Failed to refresh caches after directory deletion: {}", e);
+                }
+                return Ok(true);
+            }
+        } else if let Some(ref vol_path) = self.volume_path {
+            use std::path::Path;
+
+            if let Err(e) = crate::platform::windows::delete_directory_from_esp_with_root(vol_path, Path::new(dirname)) {
+                log::warn!(
+                    "delete_directory_from_esp_with_root failed for {}, falling back to raw delete: {}",
+                    dirname,
+                    e
+                );
+            } else {
+                log::info!("Deleted directory {} via Windows API (explicit root)", dirname);
                 if let Err(e) = self.refresh_all_caches() {
                     log::warn!("Failed to refresh caches after directory deletion: {}", e);
                 }
@@ -1324,30 +1452,36 @@ impl Fat32Volume {
             Err(e) => return Err(e),
         }
 
-        // Если устройство задано явно, нельзя использовать `write_file_to_esp` —
-        // он использует `find_esp_volume_path()` (авто-детект) и в системах с
-        // несколькими ESP запишет данные не туда. Возвращаем ошибку.
-        if self.explicit_device {
-            log::error!(
-                "write_data_with_retry: ACCESS_DENIED on explicit device; cannot fall back to auto-detect ESP API"
-            );
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Access denied writing to explicit ESP device; auto-detect fallback disabled to avoid writing to a different ESP",
-            ));
-        }
-
-        // Стратегии записи для ESP на Windows (из прототипа)
-        use crate::platform::windows::write_file_to_esp;
+        // Стратегии записи для ESP на Windows (из прототипа).
+        // Если устройство задано явно и есть volume_path, используем его вместо
+        // авто-детекта через find_esp_volume_path().
+        use crate::platform::windows::{
+            find_esp_volume_path, write_file_to_esp, write_file_to_esp_with_root,
+        };
         use std::path::Path;
         use uuid::Uuid;
 
-        // Создаем временный файл для данных
         let tmp_filename = format!("tmp-{}.bin", Uuid::new_v4());
         let tmp_path = Path::new(&tmp_filename);
 
-        // Используем write_file_to_esp для записи временных данных
-        match write_file_to_esp(tmp_path, data) {
+        let (result, vol_root) = if self.explicit_device {
+            let vol_path = self.explicit_volume_root()?;
+            let r = write_file_to_esp_with_root(&vol_path, tmp_path, data);
+            (r, Some(vol_path))
+        } else {
+            let r = write_file_to_esp(tmp_path, data);
+            (r, find_esp_volume_path())
+        };
+
+        // Best-effort cleanup: удаляем временный файл со staging-тома.
+        if let Some(ref root) = vol_root {
+            let tmp_full = root.join(&tmp_filename);
+            if let Err(e) = std::fs::remove_file(&tmp_full) {
+                log::warn!("Failed to clean up temp file {:?}: {}", tmp_full, e);
+            }
+        }
+
+        match result {
             Ok(_) => {
                 log::info!("Successfully wrote data using ESP writing strategies");
                 Ok(())
