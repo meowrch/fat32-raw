@@ -172,7 +172,7 @@ pub fn write_file_to_esp(rel_path: &Path, data: &[u8]) -> Result<()> {
 
     // Strategy 3: Try GUID path
     tried_strategies.push("GUID volume path".to_string());
-    if let Some(guid_root) = guid_volume_root_from_drive_root(root) {
+    if let Some(guid_root) = guid_volume_root_from_drive_root(&root) {
         let alt_dst = guid_root.join(&rel_path);
         if write_file_atomic(&alt_dst, data).is_ok() {
             if let Ok(f) = File::open(&alt_dst) {
